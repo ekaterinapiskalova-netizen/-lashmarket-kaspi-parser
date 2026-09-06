@@ -26,6 +26,7 @@ function cleanProductCode(value) {
 }
 
 function buildKaspiUrl(productCode) {
+  // Наш текущий тестовый товар
   if (productCode === "108538543") {
     return `https://kaspi.kz/shop/p/le-mat-edinichnye-c-0-07-mm-chernyi-mix-7-13-mm-108538543/?c=${CITY_ID}`;
   }
@@ -35,7 +36,7 @@ function buildKaspiUrl(productCode) {
 
 function normalizePrice(value) {
   if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
+    return Math.round(value);
   }
 
   if (typeof value !== "string") return null;
@@ -47,11 +48,11 @@ function normalizePrice(value) {
       .replace(",", ".")
   );
 
-  return Number.isFinite(n) ? n : null;
+  return Number.isFinite(n) ? Math.round(n) : null;
 }
 
 function collectOffers(value, out = [], depth = 0) {
-  if (depth > 10 || value == null) return out;
+  if (depth > 12 || value == null) return out;
 
   if (Array.isArray(value)) {
     for (const item of value) {
@@ -85,11 +86,18 @@ function collectOffers(value, out = [], depth = 0) {
   if (
     typeof seller === "string" &&
     seller.trim() &&
-    price !== null
+    price !== null &&
+    price > 0
   ) {
     out.push({
       seller: seller.trim(),
-      price
+      price,
+      merchantId: String(
+        value.merchantId ??
+        value.merchantUID ??
+        value.merchant?.id ??
+        ""
+      )
     });
   }
 
@@ -104,9 +112,11 @@ function uniqueOffers(offers) {
   const seen = new Set();
 
   return offers.filter((offer) => {
-    const key = `${offer.seller}|${offer.price}`;
+    const key =
+      `${String(offer.seller).toLowerCase()}|${offer.price}`;
 
     if (seen.has(key)) return false;
+
     seen.add(key);
     return true;
   });
@@ -127,14 +137,73 @@ async function launchBrowser() {
   });
 }
 
+/*
+  Самое важное место новой версии.
+
+  Этот запрос выполняется НЕ сервером Render напрямую,
+  а внутри уже открытой страницы kaspi.kz.
+
+  Поэтому Kaspi видит:
+  - настоящий Chromium;
+  - cookies страницы;
+  - origin kaspi.kz;
+  - казахстанский residential IP Decodo.
+*/
+async function fetchOffersInsideKaspi(page, productCode) {
+  return page.evaluate(
+    async ({ productCode, cityId }) => {
+      const endpoint =
+        `/yml/offer-view/offers/${encodeURIComponent(productCode)}`;
+
+      const payload = {
+        cityId,
+        id: productCode,
+        limit: 64,
+        page: 0,
+        sortOption: "PRICE"
+      };
+
+      const response = await fetch(endpoint, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Accept": "application/json, text/plain, */*",
+          "Content-Type": "application/json; charset=UTF-8"
+        },
+        body: JSON.stringify(payload)
+      });
+
+      const text = await response.text();
+
+      let json = null;
+
+      try {
+        json = JSON.parse(text);
+      } catch {
+        // оставляем json = null
+      }
+
+      return {
+        status: response.status,
+        ok: response.ok,
+        endpoint,
+        text: text.slice(0, 1000),
+        json
+      };
+    },
+    {
+      productCode,
+      cityId: CITY_ID
+    }
+  );
+}
+
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    version: 4,
-    mode: "decodo-kz-proxy",
-    proxyConfigured: proxyConfigured(),
-    proxyHost: PROXY_HOST || null,
-    proxyPort: PROXY_PORT || null
+    version: 5,
+    mode: "decodo-kz-browser-direct-offers",
+    proxyConfigured: proxyConfigured()
   });
 });
 
@@ -160,25 +229,25 @@ app.get("/proxy-test", async (req, res) => {
 
     const body = await page.textContent("body");
 
-    let data = null;
+    let result;
 
     try {
-      data = JSON.parse(body || "");
+      result = JSON.parse(body || "");
     } catch {
-      data = { raw: body };
+      result = { raw: body };
     }
 
     res.json({
       ok: true,
-      version: 4,
+      version: 5,
       proxy: "decodo-kz",
       status: response?.status() ?? null,
-      result: data
+      result
     });
   } catch (error) {
     res.status(500).json({
       ok: false,
-      version: 4,
+      version: 5,
       error: String(error?.message || error)
     });
   } finally {
@@ -187,7 +256,8 @@ app.get("/proxy-test", async (req, res) => {
 });
 
 app.get("/offers/:productCode", async (req, res) => {
-  const productCode = cleanProductCode(req.params.productCode);
+  const productCode =
+    cleanProductCode(req.params.productCode);
 
   if (!productCode) {
     return res.status(400).json({
@@ -197,7 +267,8 @@ app.get("/offers/:productCode", async (req, res) => {
   }
 
   const productUrl =
-    typeof req.query.url === "string" && req.query.url.startsWith("https://kaspi.kz/")
+    typeof req.query.url === "string" &&
+    req.query.url.startsWith("https://kaspi.kz/")
       ? req.query.url
       : buildKaspiUrl(productCode);
 
@@ -222,88 +293,214 @@ app.get("/offers/:productCode", async (req, res) => {
     const page = await context.newPage();
 
     await page.setExtraHTTPHeaders({
-      "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"
+      "Accept-Language":
+        "ru-RU,ru;q=0.9,en;q=0.8"
     });
 
+    /*
+      Оставляем и старый сетевой перехват как запасной источник.
+    */
+    const passiveOffers = [];
     const networkCandidates = [];
-    const parsedOffers = [];
 
     page.on("response", async (response) => {
       const url = response.url();
 
       if (
         url.includes("offer-view") ||
-        url.includes("/offers") ||
-        url.includes("merchant")
+        url.includes("/offers")
       ) {
         const candidate = {
           url,
           status: response.status(),
-          contentType: response.headers()["content-type"] || ""
+          contentType:
+            response.headers()["content-type"] || ""
         };
 
         try {
-          if (candidate.contentType.includes("json")) {
+          if (
+            candidate.contentType.includes("json")
+          ) {
             const json = await response.json();
+
             candidate.json = json;
 
             const found = collectOffers(json);
-            parsedOffers.push(...found);
+
+            passiveOffers.push(...found);
           }
         } catch {
-          // диагностический режим
+          // только диагностика
         }
 
         networkCandidates.push(candidate);
       }
     });
 
-    const navigation = await page.goto(productUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 90000
-    });
+    /*
+      1. Открываем реальную карточку Kaspi.
+    */
+    const navigation = await page.goto(
+      productUrl,
+      {
+        waitUntil: "domcontentloaded",
+        timeout: 90000
+      }
+    );
 
-    await page.waitForTimeout(8000);
+    /*
+      Даём странице создать cookies и JS-сессию.
+    */
+    await page.waitForTimeout(2500);
 
-    const pageTitle = await page.title().catch(() => "");
-    const bodyText = await page
-      .locator("body")
-      .innerText()
-      .catch(() => "");
+    /*
+      2. Теперь САМИ запрашиваем продавцов изнутри kaspi.kz.
 
-    const offers = uniqueOffers(parsedOffers)
-      .sort((a, b) => a.price - b.price);
+      Делаем до трёх попыток.
+    */
+    let directResult = null;
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        directResult =
+          await fetchOffersInsideKaspi(
+            page,
+            productCode
+          );
+
+        if (
+          directResult?.ok &&
+          directResult?.json
+        ) {
+          break;
+        }
+      } catch (error) {
+        directResult = {
+          ok: false,
+          status: null,
+          error:
+            String(error?.message || error),
+          attempt
+        };
+      }
+
+      await page.waitForTimeout(1500);
+    }
+
+    /*
+      3. Собираем продавцов из прямого ответа.
+    */
+    const directOffers = [];
+
+    if (directResult?.json) {
+      collectOffers(
+        directResult.json,
+        directOffers
+      );
+    }
+
+    /*
+      Плюс предложения, которые Kaspi мог загрузить самостоятельно.
+    */
+    const offers = uniqueOffers([
+      ...directOffers,
+      ...passiveOffers
+    ]).sort((a, b) => a.price - b.price);
+
+    const pageTitle =
+      await page.title().catch(() => "");
+
+    const bodyText =
+      await page
+        .locator("body")
+        .innerText()
+        .catch(() => "");
 
     res.json({
-      ok: navigation?.status() >= 200 && navigation?.status() < 400,
-      version: 4,
-      mode: "playwright-decodo-kz",
-      proxyConfigured: proxyConfigured(),
+      ok:
+        navigation?.status() >= 200 &&
+        navigation?.status() < 400,
+
+      version: 5,
+
+      mode:
+        "playwright-decodo-kz-explicit-offers",
+
+      proxyConfigured:
+        proxyConfigured(),
+
       productCode,
-      cityId: CITY_ID,
+
+      cityId:
+        CITY_ID,
+
       productUrl,
-      navigationStatus: navigation?.status() ?? null,
-      finalUrl: page.url(),
+
+      navigationStatus:
+        navigation?.status() ?? null,
+
+      finalUrl:
+        page.url(),
+
       pageTitle,
+
+      /*
+        Это главный результат для репрайсера.
+      */
       offers,
-      offerCount: offers.length,
-      networkCandidates: networkCandidates.slice(0, 20),
-      bodySample: bodyText.slice(0, 1500)
+
+      offerCount:
+        offers.length,
+
+      /*
+        Диагностика прямого запроса.
+      */
+      directFetch: {
+        ok:
+          directResult?.ok ?? false,
+
+        status:
+          directResult?.status ?? null,
+
+        endpoint:
+          directResult?.endpoint ?? null,
+
+        hasJson:
+          Boolean(directResult?.json),
+
+        responseSample:
+          directResult?.text ?? null,
+
+        error:
+          directResult?.error ?? null
+      },
+
+      networkCandidates:
+        networkCandidates.slice(0, 10),
+
+      bodySample:
+        bodyText.slice(0, 1000)
     });
   } catch (error) {
     res.status(500).json({
       ok: false,
-      version: 4,
-      mode: "playwright-decodo-kz",
+      version: 5,
+      mode:
+        "playwright-decodo-kz-explicit-offers",
       productCode,
       productUrl,
-      error: String(error?.message || error)
+      error:
+        String(error?.message || error)
     });
   } finally {
-    if (browser) await browser.close();
+    if (browser) {
+      await browser.close();
+    }
   }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Kaspi parser v4 listening on port ${PORT}`);
+  console.log(
+    `Kaspi parser v5 listening on port ${PORT}`
+  );
 });
