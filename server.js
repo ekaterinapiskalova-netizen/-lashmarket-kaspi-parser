@@ -340,13 +340,38 @@ app.get("/offers/:productCode", async (req, res) => {
     /*
       1. Открываем реальную карточку Kaspi.
     */
-    const navigation = await page.goto(
+    let navigation = null;
+let navigationError = null;
+
+for (let attempt = 1; attempt <= 3; attempt++) {
+  try {
+    navigation = await page.goto(
       productUrl,
       {
         waitUntil: "domcontentloaded",
-        timeout: 90000
+        timeout: 30000
       }
     );
+
+    navigationError = null;
+    break;
+  } catch (error) {
+    navigationError =
+      String(error?.message || error);
+
+    if (attempt < 3) {
+      await page.waitForTimeout(1000);
+    }
+  }
+}
+
+if (!navigation) {
+  throw new Error(
+    `KASPI_NAVIGATION_FAILED_AFTER_3_ATTEMPTS: ${
+      navigationError || "NO_RESPONSE"
+    }`
+  );
+}
 
     /*
       Даём странице создать cookies и JS-сессию.
