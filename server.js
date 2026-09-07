@@ -26,7 +26,6 @@ function cleanProductCode(value) {
 }
 
 function buildKaspiUrl(productCode) {
-  // Наш текущий тестовый товар
   if (productCode === "108538543") {
     return `https://kaspi.kz/shop/p/le-mat-edinichnye-c-0-07-mm-chernyi-mix-7-13-mm-108538543/?c=${CITY_ID}`;
   }
@@ -58,6 +57,7 @@ function collectOffers(value, out = [], depth = 0) {
     for (const item of value) {
       collectOffers(item, out, depth + 1);
     }
+
     return out;
   }
 
@@ -137,18 +137,26 @@ async function launchBrowser() {
   });
 }
 
-/*
-  Самое важное место новой версии.
+async function enableTrafficSaving(page) {
+  const blockedResourceTypes = new Set([
+    "image",
+    "media",
+    "font"
+  ]);
 
-  Этот запрос выполняется НЕ сервером Render напрямую,
-  а внутри уже открытой страницы kaspi.kz.
+  await page.route("**/*", async (route) => {
+    const request = route.request();
+    const resourceType = request.resourceType();
 
-  Поэтому Kaspi видит:
-  - настоящий Chromium;
-  - cookies страницы;
-  - origin kaspi.kz;
-  - казахстанский residential IP Decodo.
-*/
+    if (blockedResourceTypes.has(resourceType)) {
+      await route.abort();
+      return;
+    }
+
+    await route.continue();
+  });
+}
+
 async function fetchOffersInsideKaspi(page, productCode) {
   return page.evaluate(
     async ({ productCode, cityId }) => {
@@ -173,21 +181,18 @@ async function fetchOffersInsideKaspi(page, productCode) {
         body: JSON.stringify(payload)
       });
 
-      const text = await response.text();
-
       let json = null;
 
       try {
-        json = JSON.parse(text);
+        json = await response.json();
       } catch {
-        // оставляем json = null
+        json = null;
       }
 
       return {
         status: response.status,
         ok: response.ok,
         endpoint,
-        text: text.slice(0, 1000),
         json
       };
     },
@@ -201,8 +206,8 @@ async function fetchOffersInsideKaspi(page, productCode) {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    version: 5,
-    mode: "decodo-kz-browser-direct-offers",
+    version: 6,
+    mode: "decodo-kz-traffic-saving",
     proxyConfigured: proxyConfigured()
   });
 });
@@ -218,6 +223,8 @@ app.get("/proxy-test", async (req, res) => {
     });
 
     const page = await context.newPage();
+
+    await enableTrafficSaving(page);
 
     const response = await page.goto(
       "https://api.ipify.org?format=json",
@@ -239,7 +246,7 @@ app.get("/proxy-test", async (req, res) => {
 
     res.json({
       ok: true,
-      version: 5,
+      version: 6,
       proxy: "decodo-kz",
       status: response?.status() ?? null,
       result
@@ -247,11 +254,13 @@ app.get("/proxy-test", async (req, res) => {
   } catch (error) {
     res.status(500).json({
       ok: false,
-      version: 5,
+      version: 6,
       error: String(error?.message || error)
     });
   } finally {
-    if (browser) await browser.close();
+    if (browser) {
+      await browser.close();
+    }
   }
 });
 
@@ -262,6 +271,7 @@ app.get("/offers/:productCode", async (req, res) => {
   if (!productCode) {
     return res.status(400).json({
       ok: false,
+      safeToReprice: false,
       error: "BAD_PRODUCT_CODE"
     });
   }
@@ -292,16 +302,14 @@ app.get("/offers/:productCode", async (req, res) => {
 
     const page = await context.newPage();
 
+    await enableTrafficSaving(page);
+
     await page.setExtraHTTPHeaders({
       "Accept-Language":
         "ru-RU,ru;q=0.9,en;q=0.8"
     });
 
-    /*
-      Оставляем и старый сетевой перехват как запасной источник.
-    */
     const passiveOffers = [];
-    const networkCandidates = [];
 
     page.on("response", async (response) => {
       const url = response.url();
@@ -310,79 +318,70 @@ app.get("/offers/:productCode", async (req, res) => {
         url.includes("offer-view") ||
         url.includes("/offers")
       ) {
-        const candidate = {
-          url,
-          status: response.status(),
-          contentType:
-            response.headers()["content-type"] || ""
-        };
-
         try {
-          if (
-            candidate.contentType.includes("json")
-          ) {
-            const json = await response.json();
+          const contentType =
+            response.headers()["content-type"] || "";
 
-            candidate.json = json;
+          if (contentType.includes("json")) {
+            const json = await response.json();
 
             const found = collectOffers(json);
 
             passiveOffers.push(...found);
           }
         } catch {
-          // только диагностика
+          // Запасной источник.
+          // Ошибка здесь не ломает основной запрос.
         }
-
-        networkCandidates.push(candidate);
       }
     });
 
-    /*
-      1. Открываем реальную карточку Kaspi.
-    */
     let navigation = null;
-let navigationError = null;
+    let navigationError = null;
 
-for (let attempt = 1; attempt <= 3; attempt++) {
-  try {
-    navigation = await page.goto(
-      productUrl,
-      {
-        waitUntil: "domcontentloaded",
-        timeout: 30000
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        navigation = await page.goto(
+          productUrl,
+          {
+            waitUntil: "domcontentloaded",
+            timeout: 30000
+          }
+        );
+
+        navigationError = null;
+        break;
+      } catch (error) {
+        navigationError =
+          String(error?.message || error);
+
+        if (attempt < 3) {
+          await page.waitForTimeout(1000);
+        }
       }
-    );
-
-    navigationError = null;
-    break;
-  } catch (error) {
-    navigationError =
-      String(error?.message || error);
-
-    if (attempt < 3) {
-      await page.waitForTimeout(1000);
     }
-  }
-}
 
-if (!navigation) {
-  throw new Error(
-    `KASPI_NAVIGATION_FAILED_AFTER_3_ATTEMPTS: ${
-      navigationError || "NO_RESPONSE"
-    }`
-  );
-}
+    if (!navigation) {
+      throw new Error(
+        `KASPI_NAVIGATION_FAILED_AFTER_3_ATTEMPTS: ${
+          navigationError || "NO_RESPONSE"
+        }`
+      );
+    }
 
-    /*
-      Даём странице создать cookies и JS-сессию.
-    */
+    const navigationStatus = navigation.status();
+
+    if (
+      navigationStatus < 200 ||
+      navigationStatus >= 400
+    ) {
+      throw new Error(
+        `KASPI_BAD_NAVIGATION_STATUS_${navigationStatus}`
+      );
+    }
+
     await page.waitForTimeout(2500);
 
-    /*
-      2. Теперь САМИ запрашиваем продавцов изнутри kaspi.kz.
-
-      Делаем до трёх попыток.
-    */
     let directResult = null;
 
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -409,12 +408,11 @@ if (!navigation) {
         };
       }
 
-      await page.waitForTimeout(1500);
+      if (attempt < 3) {
+        await page.waitForTimeout(1500);
+      }
     }
 
-    /*
-      3. Собираем продавцов из прямого ответа.
-    */
     const directOffers = [];
 
     if (directResult?.json) {
@@ -424,96 +422,32 @@ if (!navigation) {
       );
     }
 
-    /*
-      Плюс предложения, которые Kaspi мог загрузить самостоятельно.
-    */
     const offers = uniqueOffers([
       ...directOffers,
       ...passiveOffers
     ]).sort((a, b) => a.price - b.price);
 
-    const pageTitle =
-      await page.title().catch(() => "");
-
-    const bodyText =
-      await page
-        .locator("body")
-        .innerText()
-        .catch(() => "");
+    if (offers.length === 0) {
+      throw new Error(
+        "NO_OFFERS_RECEIVED_PRICE_UPDATE_BLOCKED"
+      );
+    }
 
     res.json({
-      ok:
-        navigation?.status() >= 200 &&
-        navigation?.status() < 400,
-
-      version: 5,
-
-      mode:
-        "playwright-decodo-kz-explicit-offers",
-
-      proxyConfigured:
-        proxyConfigured(),
-
+      ok: true,
+      safeToReprice: true,
+      version: 6,
       productCode,
-
-      cityId:
-        CITY_ID,
-
-      productUrl,
-
-      navigationStatus:
-        navigation?.status() ?? null,
-
-      finalUrl:
-        page.url(),
-
-      pageTitle,
-
-      /*
-        Это главный результат для репрайсера.
-      */
+      cityId: CITY_ID,
       offers,
-
-      offerCount:
-        offers.length,
-
-      /*
-        Диагностика прямого запроса.
-      */
-      directFetch: {
-        ok:
-          directResult?.ok ?? false,
-
-        status:
-          directResult?.status ?? null,
-
-        endpoint:
-          directResult?.endpoint ?? null,
-
-        hasJson:
-          Boolean(directResult?.json),
-
-        responseSample:
-          directResult?.text ?? null,
-
-        error:
-          directResult?.error ?? null
-      },
-
-      networkCandidates:
-        networkCandidates.slice(0, 10),
-
-      bodySample:
-        bodyText.slice(0, 1000)
+      offerCount: offers.length
     });
   } catch (error) {
     res.status(500).json({
       ok: false,
-      version: 5,
-      mode:
-        "playwright-decodo-kz-explicit-offers",
+      safeToReprice: false,
+      version: 6,
       productCode,
-      productUrl,
       error:
         String(error?.message || error)
     });
@@ -526,6 +460,6 @@ if (!navigation) {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(
-    `Kaspi parser v5 listening on port ${PORT}`
+    `Kaspi parser v6 listening on port ${PORT}`
   );
 });
