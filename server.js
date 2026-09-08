@@ -144,11 +144,30 @@ async function enableTrafficSaving(page) {
     "font"
   ]);
 
+  const blockedHosts = [
+    "ks-static.cdn-kaspi.kz",
+    "resources.cdn-kaspi.kz",
+    "stlog.kaspi.kz"
+  ];
+
   await page.route("**/*", async (route) => {
     const request = route.request();
     const resourceType = request.resourceType();
 
+    let hostname = "";
+
+    try {
+      hostname = new URL(request.url()).hostname;
+    } catch {
+      hostname = "";
+    }
+
     if (blockedResourceTypes.has(resourceType)) {
+      await route.abort();
+      return;
+    }
+
+    if (blockedHosts.includes(hostname)) {
       await route.abort();
       return;
     }
@@ -206,8 +225,8 @@ async function fetchOffersInsideKaspi(page, productCode) {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    version: 6,
-    mode: "decodo-kz-traffic-saving",
+    version: 7,
+    mode: "decodo-kz-ultra-traffic-saving",
     proxyConfigured: proxyConfigured()
   });
 });
@@ -246,7 +265,7 @@ app.get("/proxy-test", async (req, res) => {
 
     res.json({
       ok: true,
-      version: 6,
+      version: 7,
       proxy: "decodo-kz",
       status: response?.status() ?? null,
       result
@@ -254,7 +273,7 @@ app.get("/proxy-test", async (req, res) => {
   } catch (error) {
     res.status(500).json({
       ok: false,
-      version: 6,
+      version: 7,
       error: String(error?.message || error)
     });
   } finally {
@@ -272,6 +291,7 @@ app.get("/offers/:productCode", async (req, res) => {
     return res.status(400).json({
       ok: false,
       safeToReprice: false,
+      version: 7,
       error: "BAD_PRODUCT_CODE"
     });
   }
@@ -436,7 +456,7 @@ app.get("/offers/:productCode", async (req, res) => {
     res.json({
       ok: true,
       safeToReprice: true,
-      version: 6,
+      version: 7,
       productCode,
       cityId: CITY_ID,
       offers,
@@ -446,7 +466,7 @@ app.get("/offers/:productCode", async (req, res) => {
     res.status(500).json({
       ok: false,
       safeToReprice: false,
-      version: 6,
+      version: 7,
       productCode,
       error:
         String(error?.message || error)
@@ -460,6 +480,6 @@ app.get("/offers/:productCode", async (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(
-    `Kaspi parser v6 listening on port ${PORT}`
+    `Kaspi parser v7 listening on port ${PORT}`
   );
 });
